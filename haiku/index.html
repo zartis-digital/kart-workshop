@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Haiku racing</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1b1f2a; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0;
+  function resize() { W = canvas.width = innerWidth; H = canvas.height = innerHeight; }
+  addEventListener('resize', resize);
+  resize();
+
+  // ---------- Helpers ----------
+  const TAU = Math.PI * 2;
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const wrapAngle = a => { while (a > Math.PI) a -= TAU; while (a < -Math.PI) a += TAU; return a; };
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const fmt = t => {
+    const m = Math.floor(t / 60), s = (t - m * 60).toFixed(2).padStart(5, '0');
+    return `${m}:${s}`;
+  };
+
+  // ---------- Constants ----------
+  const LAPS = 3;
+  const TRACK_HALF = 95;           // half road width (world px)
+  const MAX_SPEED = 430;
+  const ACCEL = 280;
+  const BRAKE = 500;
+  const REVERSE_MAX = 130;
+  const TURN = 2.8;                // rad/s at full speed
+  const COLORS = ['#ff3b30', '#34c759', '#0a84ff', '#ffd60a'];
+  const NAMES = ['YOU', 'BOT 1', 'BOT 2', 'BOT 3'];
+
+  // ---------- Track (closed Catmull-Rom loop) ----------
+  const CONTROL = [
+    [400, 420], [1200, 260], [2000, 300], [2700, 520], [2820, 1010], [2560, 1480],
+    [1900, 1700], [1500, 1380], [1120, 1700], [520, 1660], [260, 1220], [360, 800]
+  ];
+  const SEG = 40;
+  const pts = [];
+  for (let i = 0; i < CONTROL.length; i++) {
+    const p0 = CONTROL[(i - 1 + CONTROL.length) % CONTROL.length];
+    const p1 = CONTROL[i];
+    const p2 = CONTROL[(i + 1) % CONTROL.length];
+    const p3 = CONTROL[(i + 2) % CONTROL.length];
+    for (let s = 0; s < SEG; s++) {
+      const t = s / SEG, t2 = t * t, t3 = t2 * t;
+      const cr = (a, b, c, d) => 0.5 * ((2 * b) + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+      pts.push({ x: cr(p0[0], p1[0], p2[0], p3[0]), y: cr(p0[1], p1[1], p2[1], p3[1]) });
+    }
+  }
+  const N = pts.length;
+
+  let TRACK_LEN = 0;
+  for (let i = 0; i < N; i++) {
+    const a = pts[i], b = pts[(i + 1) % N];
+    TRACK_LEN += Math.hypot(b.x - a.x, b.y - a.y);
+  }
+  const SPACING = TRACK_LEN / N;
+
+  // Unit tangent + left normal per sample
+  const nrm = pts.map((_, i) => {
+    const a = pts[(i - 1 + N) % N], b = pts[(i + 1) % N];
+    const tx = b.x - a.x, ty = b.y - a.y, L = Math.hypot(tx, ty);
+    return { x: -ty / L, y: tx / L, tx: tx / L, ty: ty / L };
+  });
+
+  const trackPath = new Path2D();
+  pts.forEach((p, i) => (i ? trackPath.lineTo(p.x, p.y) : trackPath.moveTo(p.x, p.y)));
+  trackPath.closePath();
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  pts.forEach(p => {
+    minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y);
+  });
+
+  function nearest(x, y) {
+    let best = 0, bd = Infinity;
+    for (let i = 0; i < N; i++) {
+      const dx = pts[i].x - x, dy = pts[i].y - y, d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    return { idx: best, dist: Math.sqrt(bd) };
+  }
+
+  // Decorations (trees / rocks) placed off the road
+  const decor = [];
+  for (let tries = 0; decor.length < 160 && tries < 5000; tries++) {
+    const x = rnd(-100, 3100), y = rnd(-100, 2100);
+    if (nearest(x, y).dist < TRACK_HALF + 45) continue;
+    decor.push({ x, y, r: rnd(14, 30), tree: Math.random() < 0.6 });
+  }
+
+  // ---------- Karts ----------
+  const skids = [];
+  function makeKarts() {
+    return [0, 1, 2, 3].map(i => {
+      const gi = N - 2 - i * 10;               // grid sits just behind the start line
+      const p = pts[gi], n = nrm[gi];
+      const lat = i % 2 ? 38 : -38;
+      const human = i === 0;
+      return {
+        i, human, name: NAMES[i], color: COLORS[i],
+        x: p.x + n.x * lat, y: p.y + n.y * lat,
+        h: Math.atan2(n.ty, n.tx),
+        vx: 0, vy: 0, fv: 0, lv: 0, speed: 0,
+        idx: gi, prevIdx: gi,
+        progress: -(2 + i * 10),               // unwrapped distance in samples; < 0 = before the line
+        lap: 0, offTrack: false, done: false, place: null,
+        ai: human ? null : { skill: rnd(0.86, 1), lane: rnd(-45, 45), look: rnd(90, 130) }
+      };
+    });
+  }
+
+  let karts, cam, raceTime, paused, finished, placeCounter, lapStart, lapTimes, lapCounted, finishTime;
+  let bestLap = null;                        // kept across restarts
+  const keys = {};
+
+  function reset() {
+    karts = makeKarts();
+    cam = { x: karts[0].x, y: karts[0].y };
+    raceTime = -3;                             // countdown runs from -3 to 0
+    paused = false;
+    finished = false;
+    placeCounter = 0;
+    lapStart = 0;
+    lapTimes = [];
+    lapCounted = 0;
+    finishTime = null;
+    skids.length = 0;
+  }
+  reset();
+
+  // ---------- Physics ----------
+  function updateKart(k, dt, inp) {
+    const maxSpd = (k.offTrack ? 0.5 : 1) * MAX_SPEED * (k.ai ? k.ai.skill : 1);
+    const fx = Math.cos(k.h), fy = Math.sin(k.h);
+    let fv = k.vx * fx + k.vy * fy;          // forward speed
+    let lv = -k.vx * fy + k.vy * fx;         // lateral (sliding) speed
+
+    if (inp.throttle && fv < maxSpd) fv += ACCEL * dt;
+    if (inp.brake) {
+      fv = fv > 0 ? fv - BRAKE * dt : Math.max(fv - ACCEL * 0.5 * dt, -REVERSE_MAX);
+    }
+    if (!inp.throttle && !inp.brake) fv -= fv * 0.35 * dt;   // coasting drag
+    if (fv > maxSpd) fv -= (fv - maxSpd) * Math.min(1, 2.5 * dt);
+
+    const grip = inp.drift ? 1.1 : 6;        // drift = less lateral grip
+    lv *= Math.max(0, 1 - grip * dt);
+
+    const turnRate = TURN * (inp.drift ? 1.3 : 1);
+    k.h += inp.steer * turnRate * clamp(Math.abs(fv) / 160, 0, 1) * Math.sign(fv || 1) * dt;
+
+    const nfx = Math.cos(k.h), nfy = Math.sin(k.h);
+    k.vx = nfx * fv - nfy * lv;
+    k.vy = nfy * fv + nfx * lv;
+    k.x += k.vx * dt;
+    k.y += k.vy * dt;
+    k.fv = fv;
+    k.lv = lv;
+    k.speed = Math.abs(fv);
+
+    if (Math.abs(lv) > 140 && k.speed > 100) {
+      skids.push({ x: k.x - nfx * 16, y: k.y - nfy * 16 });
+      if (skids.length > 1200) skids.shift();
+    }
+
+    const near = nearest(k.x, k.y);
+    k.idx = near.idx;
+    k.offTrack = near.dist > TRACK_HALF;
+
+    let d = k.idx - k.prevIdx;               // unwrap around the loop
+    if (d < -N / 2) d += N;
+    if (d > N / 2) d -= N;
+    k.progress += d;
+    k.prevIdx = k.idx;
+    k.lap = Math.max(0, Math.floor(k.progress / N));
+  }
+
+  function kartCollisions() {
+    const MIN = 34;
+    for (let a = 0; a < karts.length; a++) {
+      for (let b = a + 1; b < karts.length; b++) {
+        const A = karts[a], B = karts[b];
+        const dx = B.x - A.x, dy = B.y - A.y, d = Math.hypot(dx, dy);
+        if (d > 0 && d < MIN) {
+          const push = (MIN - d) / 2, ux = dx / d, uy = dy / d;
+          A.x -= ux * push; A.y -= uy * push;
+          B.x += ux * push; B.y += uy * push;
+        }
+      }
+    }
+  }
+
+  // ---------- Input ----------
+  const down = c => !!keys[c];
+  // Touch controls: on-screen buttons, multi-touch via tracked pointers
+  const touches = new Map();                 // pointerId -> {x, y}
+  let touchMode = matchMedia('(pointer: coarse)').matches;
+  function touchButtons() {
+    const bs = clamp(Math.min(W, H) * 0.2, 56, 110), g = 12, m = 16;
+    const by = H - bs - m;
+    return [
+      { id: 'left',  label: '◀', x: m, y: by, w: bs, h: bs },
+      { id: 'right', label: '▶', x: m + bs + g, y: by, w: bs, h: bs },
+      { id: 'gas',   label: 'GAS', x: W - m - bs, y: by, w: bs, h: bs },
+      { id: 'brake', label: 'BRAKE', x: W - m - 2 * bs - g, y: by, w: bs, h: bs },
+      { id: 'drift', label: 'DRIFT', x: W - m - bs, y: by - bs - g, w: bs, h: bs },
+      { id: 'pause', label: '❚❚', x: W / 2 - 24, y: H - 48 - m, w: 48, h: 48 }
+    ];
+  }
+  function touchState() {
+    const on = {};
+    if (!touches.size) return on;
+    const btns = touchButtons();
+    touches.forEach(t => btns.forEach(b => {
+      if (t.x >= b.x && t.x <= b.x + b.w && t.y >= b.y && t.y <= b.y + b.h) on[b.id] = true;
+    }));
+    return on;
+  }
+  function playerInput() {
+    const t = touchState();
+    return {
+      throttle: down('ArrowUp') || down('KeyW') || !!t.gas,
+      brake: down('ArrowDown') || down('KeyS') || !!t.brake,
+      steer: (down('ArrowRight') || down('KeyD') || t.right ? 1 : 0) - (down('ArrowLeft') || down('KeyA') || t.left ? 1 : 0),
+      drift: down('Space') || down('ShiftLeft') || down('ShiftRight') || !!t.drift
+    };
+  }
+  function aiInput(k) {
+    const t = (k.idx + Math.round(k.ai.look / SPACING)) % N;
+    const p = pts[t], n = nrm[t];
+    const tx = p.x + n.x * k.ai.lane, ty = p.y + n.y * k.ai.lane;
+    const diff = wrapAngle(Math.atan2(ty - k.y, tx - k.x) - k.h);
+    return {
+      throttle: true,
+      brake: Math.abs(diff) > 0.9 && k.speed > 220,
+      steer: clamp(diff * 2.5, -1, 1),
+      drift: false
+    };
+  }
+
+  // ---------- Update ----------
+  function update(dt) {
+    if (!finished) raceTime += dt;
+    if (raceTime < 0) return;                // lights out not yet
+
+    karts.forEach(k => {
+      const inp = k.done ? { throttle: false, brake: false, steer: 0, drift: false }
+                         : k.human ? playerInput() : aiInput(k);
+      updateKart(k, dt, inp);
+    });
+    kartCollisions();
+
+    const player = karts[0];
+    if (player.lap > lapCounted) {           // lap completed
+      const t = raceTime - lapStart;
+      lapTimes.push(t);
+      if (bestLap === null || t < bestLap) bestLap = t;
+      lapStart = raceTime;
+      lapCounted = player.lap;
+    }
+
+    karts.forEach(k => {
+      if (!k.done && k.progress >= LAPS * N) {
+        k.done = true;
+        k.place = ++placeCounter;
+        if (k.human) { finished = true; finishTime = raceTime; }
+      }
+    });
+  }
+
+  // ---------- Camera ----------
+  function updateCam(dt) {
+    const p = karts[0];
+    const tx = p.x + p.vx * 0.25, ty = p.y + p.vy * 0.25;
+    const a = Math.min(1, dt * 6);
+    cam.x += (tx - cam.x) * a;
+    cam.y += (ty - cam.y) * a;
+  }
+
+  // ---------- Drawing ----------
+  function drawTrack(zoom) {
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#c0392b';                       // kerb base
+    ctx.lineWidth = TRACK_HALF * 2 + 18;
+    ctx.stroke(trackPath);
+    ctx.strokeStyle = '#f5f5f5';                       // kerb stripes
+    ctx.setLineDash([22, 22]);
+    ctx.stroke(trackPath);
+    ctx.setLineDash([]);
+    ctx.strokeStyle = '#4b4f5a';                       // asphalt
+    ctx.lineWidth = TRACK_HALF * 2;
+    ctx.stroke(trackPath);
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)';        // centre line
+    ctx.lineWidth = 5;
+    ctx.setLineDash([30, 30]);
+    ctx.stroke(trackPath);
+    ctx.setLineDash([]);
+
+    // Start/finish chequered line
+    const n = nrm[0];
+    ctx.save();
+    ctx.translate(pts[0].x, pts[0].y);
+    ctx.rotate(Math.atan2(n.ty, n.tx));
+    const cell = (TRACK_HALF * 2) / 12;
+    for (let row = 0; row < 2; row++) {
+      for (let col = 0; col < 12; col++) {
+        ctx.fillStyle = (row + col) % 2 ? '#fff' : '#111';
+        ctx.fillRect(-12 + row * 12, -TRACK_HALF + col * cell, 12, cell);
+      }
+    }
+    ctx.restore();
+  }
+
+  function drawDecor() {
+    decor.forEach(d => {
+      if (d.tree) {
+        ctx.fillStyle = 'rgba(0,0,0,0.25)';
+        ctx.beginPath(); ctx.arc(d.x + 6, d.y + 6, d.r, 0, TAU); ctx.fill();
+        ctx.fillStyle = '#2e6b2b';
+        ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, TAU); ctx.fill();
+        ctx.fillStyle = '#3f8f3a';
+        ctx.beginPath(); ctx.arc(d.x - d.r * 0.25, d.y - d.r * 0.25, d.r * 0.6, 0, TAU); ctx.fill();
+      } else {
+        ctx.fillStyle = '#8a8f98';
+        ctx.beginPath(); ctx.arc(d.x, d.y, d.r * 0.6, 0, TAU); ctx.fill();
+      }
+    });
+  }
+
+  function drawSkids() {
+    ctx.fillStyle = 'rgba(20,20,20,0.3)';
+    skids.forEach(s => { ctx.beginPath(); ctx.arc(s.x, s.y, 4, 0, TAU); ctx.fill(); });
+  }
+
+  function drawKart(k) {
+    ctx.save();
+    ctx.translate(k.x, k.y);
+    ctx.rotate(k.h);
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';                 // shadow
+    ctx.beginPath(); ctx.ellipse(2, 3, 22, 14, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#111';                            // wheels
+    [[-13, -12], [-13, 12], [12, -12], [12, 12]].forEach(([x, y]) => ctx.fillRect(x - 5, y - 3, 10, 6));
+    ctx.fillStyle = k.color;                           // body
+    ctx.beginPath(); ctx.roundRect(-18, -11, 36, 22, 6); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.4)'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#222';                            // rear spoiler
+    ctx.fillRect(-19, -13, 5, 26);
+    ctx.beginPath(); ctx.roundRect(-2, -7, 10, 14, 3); ctx.fill();   // cockpit
+    ctx.restore();
+
+    ctx.font = 'bold 13px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillStyle = '#fff';
+    ctx.strokeText(k.name, k.x, k.y - 26);
+    ctx.fillText(k.name, k.x, k.y - 26);
+  }
+
+  function drawHUD() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    const player = karts[0];
+    const rank = 1 + karts.filter(k => k !== player && k.progress > player.progress).length;
+    const lapShown = Math.min(player.lap + 1, LAPS);
+    const speedKmh = Math.round(player.speed * 0.35);
+
+    const hs = clamp(Math.min(W / 760, H / 520), 0.5, 1);   // shrink HUD on small screens
+    ctx.setTransform(hs, 0, 0, hs, 0, 0);
+
+    // Top-left panel
+    panel(16, 16, 220, 120);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 40px system-ui, sans-serif';
+    ctx.fillText(`P${rank}`, 30, 68);
+    ctx.font = 'bold 18px system-ui, sans-serif';
+    ctx.fillText(`LAP ${lapShown}/${LAPS}`, 120, 52);
+    ctx.font = '16px system-ui, sans-serif';
+    ctx.fillStyle = '#cfd6e4';
+    ctx.fillText(`of ${karts.length}`, 120, 74);
+    ctx.font = 'bold 18px monospace';
+    ctx.fillStyle = '#fff';
+    ctx.fillText(fmt(Math.max(0, finished ? finishTime : raceTime)), 30, 110);
+
+    // Top-right panel: speed and lap times
+    ctx.setTransform(hs, 0, 0, hs, W * (1 - hs), 0);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 26px system-ui, sans-serif';
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+    ctx.strokeText('Haiku racing', W - 16, 38);
+    ctx.fillText('Haiku racing', W - 16, 38);
+
+    const oy = 48;
+    panel(W - 236, 16 + oy, 220, 150, 'right');
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 34px system-ui, sans-serif';
+    ctx.fillText(`${speedKmh}`, W - 60, 56 + oy);
+    ctx.font = '14px system-ui, sans-serif';
+    ctx.fillStyle = '#cfd6e4';
+    ctx.fillText('km/h', W - 30, 56 + oy);
+    ctx.font = '14px monospace';
+    ctx.fillStyle = '#fff';
+    lapTimes.slice(-3).forEach((t, i) => ctx.fillText(`Lap ${lapTimes.length - Math.min(3, lapTimes.length) + i + 1}  ${fmt(t)}`, W - 30, 86 + oy + i * 20));
+    ctx.fillStyle = '#ffd60a';
+    ctx.fillText(`Best  ${bestLap === null ? '--:--.--' : fmt(bestLap)}`, W - 30, 86 + oy + 3 * 20 + 6);
+
+    // Minimap (bottom-left; top-centre on touch devices so it clears the buttons)
+    const mw = 200, mh = 140;
+    let mx = 16, my = H - mh - 16;
+    if (touchMode) {
+      ctx.setTransform(hs, 0, 0, hs, W / 2 * (1 - hs), 0);
+      mx = W / 2 - mw / 2; my = 16;
+    } else {
+      ctx.setTransform(hs, 0, 0, hs, 0, H * (1 - hs));
+    }
+    panel(mx, my, mw, mh);
+    const s = Math.min((mw - 20) / (maxX - minX), (mh - 20) / (maxY - minY));
+    ctx.save();
+    ctx.beginPath(); ctx.rect(mx, my, mw, mh); ctx.clip();
+    ctx.translate(mx + mw / 2 - ((minX + maxX) / 2) * s, my + mh / 2 - ((minY + maxY) / 2) * s);
+    ctx.scale(s, s);
+    ctx.strokeStyle = '#8c929e';
+    ctx.lineWidth = (TRACK_HALF * 2) ;
+    ctx.stroke(trackPath);
+    karts.slice().reverse().forEach(k => {
+      ctx.fillStyle = k.color;
+      ctx.beginPath(); ctx.arc(k.x, k.y, 60, 0, TAU); ctx.fill();
+    });
+    ctx.restore();
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+    if (touchMode) {
+      drawTouchControls();
+    } else {
+      ctx.textAlign = 'center';
+      ctx.font = '13px system-ui, sans-serif';
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.fillText('Arrows / WASD: drive   ·   Space / Shift: drift   ·   P: pause   ·   R: restart', W / 2, H - 14);
+    }
+
+    // Centre messages
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    if (raceTime < 0) {
+      bigText(String(Math.ceil(-raceTime)));
+    } else if (raceTime < 0.9 && !finished) {
+      bigText('GO!', '#34c759');
+    }
+    ctx.textBaseline = 'alphabetic';
+
+    if (paused) {
+      overlay(['PAUSED', touchMode ? 'Tap to resume' : 'Press P to resume']);
+    } else if (finished) {
+      drawResults();
+    }
+  }
+
+  function drawTouchControls() {
+    const on = touchState();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    touchButtons().forEach(b => {
+      ctx.fillStyle = on[b.id] ? 'rgba(255,255,255,0.45)' : 'rgba(15,18,28,0.5)';
+      ctx.beginPath(); ctx.roundRect(b.x, b.y, b.w, b.h, b.id === 'pause' ? 24 : 18); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = '#fff';
+      ctx.font = `bold ${b.label.length > 2 ? Math.round(b.w * 0.2) : Math.round(b.w * 0.4)}px system-ui, sans-serif`;
+      ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2);
+    });
+    ctx.textBaseline = 'alphabetic';
+  }
+
+  function panel(x, y, w, h, _align) {
+    ctx.fillStyle = 'rgba(15,18,28,0.72)';
+    ctx.beginPath(); ctx.roundRect(x, y, w, h, 12); ctx.fill();
+  }
+
+  function bigText(txt, color = '#fff') {
+    ctx.font = 'bold 120px system-ui, sans-serif';
+    ctx.lineWidth = 10;
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillStyle = color;
+    ctx.strokeText(txt, W / 2, H / 2);
+    ctx.fillText(txt, W / 2, H / 2);
+  }
+
+  function overlay(lines) {
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 56px system-ui, sans-serif';
+    ctx.fillText(lines[0], W / 2, H / 2 - 20);
+    ctx.font = '22px system-ui, sans-serif';
+    ctx.fillText(lines[1], W / 2, H / 2 + 24);
+  }
+
+  function drawResults() {
+    const list = karts.slice().sort((a, b) => (a.place ?? 99) - (b.place ?? 99) || b.progress - a.progress);
+    const pw = 420, ph = 92 + list.length * 34 + 60;
+    const px = W / 2 - pw / 2, py = H / 2 - ph / 2;
+    ctx.fillStyle = 'rgba(15,18,28,0.9)';
+    ctx.beginPath(); ctx.roundRect(px, py, pw, ph, 16); ctx.fill();
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 34px system-ui, sans-serif';
+    ctx.fillText(karts[0].place === 1 ? 'YOU WIN!' : `FINISHED P${karts[0].place}`, W / 2, py + 50);
+    ctx.font = '16px monospace';
+    ctx.fillStyle = '#cfd6e4';
+    ctx.fillText(`Race time ${fmt(finishTime)}`, W / 2, py + 76);
+
+    list.forEach((k, i) => {
+      const y = py + 116 + i * 34;
+      const place = k.place ?? '-';
+      ctx.textAlign = 'left';
+      ctx.fillStyle = k.color;
+      ctx.beginPath(); ctx.arc(px + 40, y - 6, 8, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 18px system-ui, sans-serif';
+      ctx.fillText(`${place}.  ${k.name}`, px + 60, y);
+      ctx.textAlign = 'right';
+      ctx.font = '16px monospace';
+      ctx.fillText(k.done ? 'finished' : `lap ${Math.min(k.lap + 1, LAPS)}`, px + pw - 30, y);
+    });
+
+    ctx.textAlign = 'center';
+    ctx.font = '16px system-ui, sans-serif';
+    ctx.fillStyle = '#ffd60a';
+    ctx.fillText(touchMode ? 'Tap to race again' : 'Press R or click to race again', W / 2, py + ph - 22);
+  }
+
+  function draw() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#4a9e44';
+    ctx.fillRect(0, 0, W, H);
+
+    const zoom = clamp(Math.min(W / 1000, H / 650), 0.5, 1.5);
+    ctx.setTransform(zoom, 0, 0, zoom, W / 2 - cam.x * zoom, H / 2 - cam.y * zoom);
+
+    drawDecor();
+    drawTrack(zoom);
+    drawSkids();
+    [...karts].sort((a, b) => a.y - b.y).forEach(drawKart);
+    drawHUD();
+  }
+
+  // ---------- Events ----------
+  const PREVENT = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'];
+  addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (PREVENT.includes(e.code)) e.preventDefault();
+    if (e.repeat) return;
+    if (e.code === 'KeyR') reset();
+    if (e.code === 'KeyP' && !finished) paused = !paused;
+  });
+  addEventListener('keyup', e => { keys[e.code] = false; });
+  addEventListener('blur', () => {
+    touches.clear();
+    Object.keys(keys).forEach(c => { keys[c] = false; });
+    if (!finished && raceTime >= 0) paused = true;
+  });
+  canvas.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'touch') touchMode = true;
+    if (finished) { reset(); return; }
+    if (paused) { paused = false; return; }
+    if (e.pointerType !== 'touch') return;
+    touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const pb = touchButtons().find(b => b.id === 'pause');
+    if (e.clientX >= pb.x && e.clientX <= pb.x + pb.w && e.clientY >= pb.y && e.clientY <= pb.y + pb.h && raceTime >= 0) {
+      paused = true;
+      touches.clear();
+    }
+  });
+  canvas.addEventListener('pointermove', e => {
+    if (touches.has(e.pointerId)) touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  });
+  ['pointerup', 'pointercancel'].forEach(t => canvas.addEventListener(t, e => touches.delete(e.pointerId)));
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  // ---------- Loop ----------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    if (!paused) update(dt);
+    updateCam(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
